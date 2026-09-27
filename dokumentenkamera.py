@@ -1,6 +1,8 @@
 import sys
 import json
 import cv2
+import time
+from datetime import datetime
 from pathlib import Path
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget,
@@ -12,10 +14,11 @@ from PySide6.QtGui import QImage, QPixmap, QPainter, QPen, QColor, QGuiApplicati
 
 
 # ------------------------------------------------------------------ #
-#  Einstellungen                                                        #
+#  Einstellungen (~/.config)                                         #
 # ------------------------------------------------------------------ #
 
-SETTINGS_FILE = Path("settings.json")
+CONFIG_DIR = Path.home() / ".config" / "dokumentenkamera"
+SETTINGS_FILE = CONFIG_DIR / "settings.json"
 
 def load_settings():
     if SETTINGS_FILE.exists():
@@ -27,8 +30,12 @@ def load_settings():
     return {}
 
 def save_settings(data: dict):
-    with open(SETTINGS_FILE, "w") as f:
-        json.dump(data, f, indent=2)
+    try:
+        CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+        with open(SETTINGS_FILE, "w") as f:
+            json.dump(data, f, indent=2)
+    except Exception as e:
+        print(f"Fehler beim Speichern der Einstellungen: {e}")
 
 
 # ------------------------------------------------------------------ #
@@ -99,6 +106,15 @@ class CameraWidget(QWidget):
         self.zoom_min = 1.0
         self.zoom_max = 5.0
 
+        # Videoaufnahme
+        self.recording = False
+        self.video_writer = None
+        self.recording_filename = ""
+        self.recording_size = (1920, 1080)
+        self.recording_fps = 30.0
+        self.recording_start_time = 0.0
+        self.recording_frames_written = 0
+
         # Auswahlrechteck
         self.selecting = False
         self.selection_start = QPoint()
@@ -120,13 +136,102 @@ class CameraWidget(QWidget):
         self.thread.start()
 
     # ------------------------------------------------------------------ #
-    #  Frame-Verarbeitung                                                  #
+    #  Frame-Verarbeitung & Aufnahme                                       #
     # ------------------------------------------------------------------ #
 
     def on_frame_ready(self, frame):
         if not self.frozen:
             self.current_frame = frame
             self.update()
+
+        # Falls Aufnahme läuft, Frame mit Zoomfaktor schreiben
+        if self.recording and self.video_writer is not None:
+            rec_src = self.frozen_frame if (self.frozen and self.frozen_frame is not None) else frame
+            if rec_src is not None:
+                h, w = rec_src.shape[:2]
+                if self.zoom_factor > 1.0:
+                    new_w = int(w / self.zoom_factor)
+                    new_h = int(h / self.zoom_factor)
+                    zx = (w - new_w) // 2
+                    zy = (h - new_h) // 2
+                    crop = rec_src[zy:zy + new_h, zx:zx + new_w]
+                    rec_frame = cv2.resize(crop, self.recording_size, interpolation=cv2.INTER_LINEAR)
+                else:
+                    if (w, h) != self.recording_size:
+                        rec_frame = cv2.resize(rec_src, self.recording_size, interpolation=cv2.INTER_LINEAR)
+                    else:
+                        rec_frame = rec_src
+                self.video_writer.write(rec_frame)
+
+    def start_recording(self):
+        if self.recording:
+            return self.recording_filename
+
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        filename = f"aufnahme_{timestamp}.mp4"
+        self.recording_filename = filename
+
+        if self.current_frame is not None:
+            h, w = self.current_frame.shape[:2]
+        else:
+            w = int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH)) or 1920
+            h = int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT)) or 1080
+
+        self.recording_size = (w, h)
+        self.recording_fps = 30.0  # Fester Ziel-FPS-Wert für gleichmäßige Wiedergabe
+        self.recording_start_time = time.time()
+        self.recording_frames_written = 0
+
+        fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+        self.video_writer = cv2.VideoWriter(filename, fourcc, self.recording_fps, (w, h))
+        if not self.video_writer.isOpened():
+            filename = f"aufnahme_{timestamp}.avi"
+            self.recording_filename = filename
+            fourcc = cv2.VideoWriter_fourcc(*'XVID')
+            self.video_writer = cv2.VideoWriter(filename, fourcc, self.recording_fps, (w, h))
+
+        self.recording = True
+        return self.recording_filename
+
+    def on_frame_ready(self, frame):
+        if not self.frozen:
+            self.current_frame = frame
+            self.update()
+
+        # Aufnahme mit Zeitstempel-Synchronisation
+        if self.recording and self.video_writer is not None:
+            rec_src = self.frozen_frame if (self.frozen and self.frozen_frame is not None) else frame
+            if rec_src is not None:
+                h, w = rec_src.shape[:2]
+                
+                # Zoom berücksichtigen
+                if self.zoom_factor > 1.0:
+                    new_w = int(w / self.zoom_factor)
+                    new_h = int(h / self.zoom_factor)
+                    zx = (w - new_w) // 2
+                    zy = (h - new_h) // 2
+                    crop = rec_src[zy:zy + new_h, zx:zx + new_w]
+                    rec_frame = cv2.resize(crop, self.recording_size, interpolation=cv2.INTER_LINEAR)
+                else:
+                    if (w, h) != self.recording_size:
+                        rec_frame = cv2.resize(rec_src, self.recording_size, interpolation=cv2.INTER_LINEAR)
+                    else:
+                        rec_frame = rec_src
+
+                # Ermitteln, wie viele Frames bis zum jetzigen Zeitpunkt existieren müssten
+                elapsed = time.time() - self.recording_start_time
+                target_frames = max(1, int(elapsed * self.recording_fps))
+
+                # Fehlende Frames durch Wiederholung auffüllen
+                while self.recording_frames_written < target_frames:
+                    self.video_writer.write(rec_frame)
+                    self.recording_frames_written += 1
+
+    def stop_recording(self):
+        self.recording = False
+        if self.video_writer is not None:
+            self.video_writer.release()
+            self.video_writer = None
 
     def get_frame_geometry(self):
         frame = self.frozen_frame if self.frozen else self.current_frame
@@ -209,7 +314,8 @@ class CameraWidget(QWidget):
             self.selection_rect = QRect()
             self.update()
         elif event.button() == Qt.RightButton:
-            self.toggle_freeze()
+            if self.main_window:
+                self.main_window.toggle_freeze()
         elif event.button() == Qt.MiddleButton:
             if self.main_window:
                 self.main_window.trigger_autofocus()
@@ -252,10 +358,16 @@ class CameraWidget(QWidget):
 
     def keyPressEvent(self, event):
         if event.key() == Qt.Key_Space:
-            self.toggle_freeze()
-        elif event.key() in (Qt.Key_Return, Qt.Key_Enter):
+            if self.main_window:
+                self.main_window.toggle_freeze()
+        elif event.key() == Qt.Key_F5:
             if self.main_window:
                 self.main_window.trigger_autofocus()
+        elif event.key() in (Qt.Key_Return, Qt.Key_Enter):
+            if self.main_window:
+                self.main_window.toggle_recording()
+        else:
+            super().keyPressEvent(event)
 
     # ------------------------------------------------------------------ #
     #  Aktionen                                                            #
@@ -277,6 +389,13 @@ class CameraWidget(QWidget):
         self.update()
 
     def switch_camera(self, index):
+        if self.recording:
+            self.stop_recording()
+            if self.main_window and hasattr(self.main_window, "btn_record"):
+                self.main_window.btn_record.setChecked(False)
+                self.main_window.btn_record.setText("Aufnahme [Enter]")
+                self.main_window.btn_record.setStyleSheet("height: 36px; padding: 0px 8px;")
+
         self.thread.stop()
         self.cap.release()
 
@@ -329,6 +448,8 @@ class CameraWidget(QWidget):
         self.clipboard_copied.emit()
 
     def closeEvent(self, event):
+        if self.recording:
+            self.stop_recording()
         self.thread.stop()
         self.cap.release()
 
@@ -341,7 +462,7 @@ class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("Dokumentenkamera")
-        self.resize(1024, 768)
+        self.resize(1250, 757)
 
         self.settings = load_settings()
 
@@ -361,7 +482,6 @@ class MainWindow(QMainWindow):
 
         # Kamera-Widget
         self.camera = CameraWidget(start_index, main_window=self)
-        self.camera.clipboard_copied.connect(self.show_copied)
         layout.addWidget(self.camera)
 
         # ---- Button-Leiste ------------------------------------------- #
@@ -418,23 +538,25 @@ class MainWindow(QMainWindow):
         self.resolution_box.currentIndexChanged.connect(self.change_resolution)
         btn_layout.addWidget(self.resolution_box)
 
-        # Einstellungen speichern
-        self.btn_save = QPushButton("Speichern")
-        self.btn_save.setStyleSheet(BTN_STYLE)
-        self.btn_save.clicked.connect(self.save_current_settings)
-        btn_layout.addWidget(self.btn_save)
-
         # Anhalten
         self.btn_freeze = QPushButton("Anhalten  [Space / Rechtsklick]")
         self.btn_freeze.setStyleSheet(BTN_STYLE)
-        self.btn_freeze.clicked.connect(self.camera.toggle_freeze)
+        self.btn_freeze.setFixedWidth(210)
+        self.btn_freeze.clicked.connect(self.toggle_freeze)
         btn_layout.addWidget(self.btn_freeze)
 
         # Autofokus
-        self.btn_focus = QPushButton("Autofokus  [Enter / Mittelklick]")
+        self.btn_focus = QPushButton("Autofokus  [F5 / Mittelklick]")
         self.btn_focus.setStyleSheet(BTN_STYLE)
         self.btn_focus.clicked.connect(self.trigger_autofocus)
         btn_layout.addWidget(self.btn_focus)
+
+        # Aufnahme
+        self.btn_record = QPushButton("Aufnahme [Enter]")
+        self.btn_record.setCheckable(True)
+        self.btn_record.setStyleSheet(BTN_STYLE)
+        self.btn_record.clicked.connect(self.toggle_recording)
+        btn_layout.addWidget(self.btn_record)
 
         # Vollbild
         self.btn_fullscreen = QPushButton("Vollbild  [F11 / Doppelklick]")
@@ -444,13 +566,6 @@ class MainWindow(QMainWindow):
 
         # Flexibler Abstand
         btn_layout.addStretch()
-
-        # Status Live/Angehalten
-        self.status_label = QLabel("Live")
-        self.status_label.setFixedWidth(120)
-        self.status_label.setStyleSheet(BTN_STYLE + "font-weight: bold;")
-        self.status_label.setAlignment(Qt.AlignCenter)
-        btn_layout.addWidget(self.status_label)
 
         # Zoom-Wert
         self.zoom_value_label = QLabel("1.0×")
@@ -470,18 +585,30 @@ class MainWindow(QMainWindow):
         self.zoom_slider.valueChanged.connect(self.on_zoom_slider)
         btn_layout.addWidget(self.zoom_slider)
 
-        # Timer: Statusmeldungen zurücksetzen
-        self.msg_timer = QTimer()
-        self.msg_timer.setSingleShot(True)
-        self.msg_timer.timeout.connect(self.update_status)
-
         # Status-Timer
         self.status_timer = QTimer()
         self.status_timer.timeout.connect(self.update_status)
         self.status_timer.start(200)
 
     # ------------------------------------------------------------------ #
-    #  Vollbild                                                            #
+    #  Aufnahme                                                            #
+    # ------------------------------------------------------------------ #
+
+    def toggle_recording(self):
+        if not self.camera.recording:
+            filename = self.camera.start_recording()
+            self.btn_record.setChecked(True)
+            self.btn_record.setText(f"Stop [{filename}] [Enter]")
+            self.btn_record.setStyleSheet(
+                "height: 36px; padding: 0px 8px; color: red; font-weight: bold;")
+        else:
+            self.camera.stop_recording()
+            self.btn_record.setChecked(False)
+            self.btn_record.setText("Aufnahme [Enter]")
+            self.btn_record.setStyleSheet("height: 36px; padding: 0px 8px;")
+
+    # ------------------------------------------------------------------ #
+    #  Vollbild / Freeze / Autofokus                                       #
     # ------------------------------------------------------------------ #
 
     def toggle_fullscreen(self):
@@ -492,15 +619,16 @@ class MainWindow(QMainWindow):
             self.showFullScreen()
             self.btn_fullscreen.setText("Vollbild beenden  [F11 / Doppelklick]")
 
-    # ------------------------------------------------------------------ #
-    #  Autofokus                                                           #
-    # ------------------------------------------------------------------ #
+    def toggle_freeze(self):
+        self.camera.toggle_freeze()
+        if self.camera.frozen:
+            self.btn_freeze.setText("Fortsetzen [Space / Rechtsklick]")
+        else:
+            self.btn_freeze.setText("Anhalten [Space / Rechtsklick]")
 
     def trigger_autofocus(self):
         index = self.resolution_box.currentIndex()
         self.change_resolution(index)
-        self.status_label.setText("Fokussiert!")
-        self.msg_timer.start(2000)
 
     # ------------------------------------------------------------------ #
     #  Zoom-Slider                                                         #
@@ -535,31 +663,25 @@ class MainWindow(QMainWindow):
         self.camera.thread.start()
 
     # ------------------------------------------------------------------ #
-    #  Einstellungen                                                        #
+    #  Einstellungen speichern                                            #
     # ------------------------------------------------------------------ #
 
     def save_current_settings(self):
-        data = {
-            "camera_index":     self.available_cameras[self.camera_box.currentIndex()],
-            "resolution_index": self.resolution_box.currentIndex(),
-        }
-        save_settings(data)
-        self.status_label.setText("Gespeichert!")
-        self.msg_timer.start(2000)
+        if not self.available_cameras:
+            return
+        cam_idx = self.camera_box.currentIndex()
+        if 0 <= cam_idx < len(self.available_cameras):
+            data = {
+                "camera_index":     self.available_cameras[cam_idx],
+                "resolution_index": self.resolution_box.currentIndex(),
+            }
+            save_settings(data)
 
     # ------------------------------------------------------------------ #
     #  Status                                                              #
     # ------------------------------------------------------------------ #
 
-    def show_copied(self):
-        self.status_label.setText("Kopiert!")
-        self.msg_timer.start(2000)
-
     def update_status(self):
-        if self.camera.frozen:
-            self.status_label.setText("Angehalten")
-        else:
-            self.status_label.setText("Live")
         self.zoom_slider.blockSignals(True)
         self.zoom_slider.setValue(int(self.camera.zoom_factor * 10))
         self.zoom_slider.blockSignals(False)
@@ -572,10 +694,15 @@ class MainWindow(QMainWindow):
     def keyPressEvent(self, event):
         if event.key() == Qt.Key_F11:
             self.toggle_fullscreen()
+        elif event.key() in (Qt.Key_Return, Qt.Key_Enter):
+            self.toggle_recording()
         else:
-            self.camera.keyPressEvent(event)
+            super().keyPressEvent(event)
 
     def closeEvent(self, event):
+        self.save_current_settings()
+        if self.camera.recording:
+            self.camera.stop_recording()
         self.camera.thread.stop()
         self.camera.cap.release()
         event.accept()
